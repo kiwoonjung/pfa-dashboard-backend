@@ -4,12 +4,40 @@ const knex = require("knex")(require("../knexfile"));
 
 exports.getAllKits = async (req, res) => {
   try {
-    const data = await knex("kits");
-    res.status(200).json(data);
+    const kits = await knex("kits")
+      .select("kits.*")
+      .leftJoin("kit_lines", "kits.sku", "kit_lines.kit_sku")
+      .leftJoin("items", "kit_lines.id", "items.kit_line_id")
+      .modify((query) => {
+        // To avoid duplicate entries when joining, group rows for aggregation
+        query
+          .select(
+            knex.raw(`
+          JSON_AGG(
+            DISTINCT jsonb_build_object(
+              'line_name', kit_lines.line_name,
+              'combine', kit_lines.combine,
+              'quantity', kit_lines.quantity,
+              'items', (
+                SELECT JSON_AGG(DISTINCT jsonb_build_object(
+                  'sku', items.sku,
+                  'code', items.code,
+                  'description', items.description
+                )) FROM items WHERE kit_lines.id = items.kit_line_id
+              )
+            )
+          ) AS kit_lines
+        `)
+          )
+          .groupBy("kits.sku");
+      });
+
+    res.status(200).json(kits);
   } catch (error) {
-    res.status(400).json({
-      message: "There was an error getting kits",
-      error: error,
+    console.error("Error fetching kits:", error);
+    res.status(500).json({
+      message: "Failed to fetch kits from the database.",
+      error: error.message,
     });
   }
 };
@@ -30,6 +58,7 @@ exports.getAllKitsFromSkuVault = async (req, res) => {
     let response;
     let retry = true;
 
+    // Fetch the data from the API with retry logic
     while (retry) {
       try {
         response = await axios.post(apiUrl, data, { headers });
@@ -50,9 +79,53 @@ exports.getAllKitsFromSkuVault = async (req, res) => {
       }
     }
 
-    res.status(200).send(response.data);
+    const kits = response.data.Kits; // Extract Kits array from API response
+
+    // Insert the data into the database
+    await knex.transaction(async (trx) => {
+      for (const kit of kits) {
+        // Insert into `kits` table
+        await trx("kits").insert({
+          sku: kit.SKU,
+          code: kit.Code,
+          cost: kit.Cost,
+          description: kit.Description,
+          last_modified_date_time_utc: kit.LastModifiedDateTimeUtc || null,
+          available_quantity: kit.AvailableQuantity || 0,
+          available_quantity_last_modified_date_time_utc:
+            kit.AvailableQuantityLastModifiedDateTimeUtc || null,
+        });
+
+        // Insert into `kit_lines` table
+        for (const line of kit.KitLines) {
+          const [kitLineId] = await trx("kit_lines").insert(
+            {
+              kit_sku: kit.SKU,
+              line_name: line.LineName,
+              combine: line.Combine,
+              quantity: line.Quantity,
+            },
+            ["id"] // Return the inserted ID for this row
+          );
+
+          // Insert into `items` table
+          for (const item of line.Items) {
+            await trx("items").insert({
+              kit_line_id: kitLineId.id,
+              sku: item.SKU,
+              code: item.Code,
+              description: item.Description,
+            });
+          }
+        }
+      }
+    });
+
+    res
+      .status(200)
+      .json({ message: "Kits successfully saved to the database" });
   } catch (error) {
     console.error("Error:", error.message);
-    res.status(500).json({ error: "Something went wrong." });
+    res.status(500).json({ error: "Failed to save kits to the database." });
   }
 };
